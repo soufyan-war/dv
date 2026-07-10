@@ -3,13 +3,15 @@ const express = require('express');
 const axios = require('axios');
 
 const app = express();
+
+// ⚠️ مهم جداً: express.json() خاصو يكون باش يقرا الـ body
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 
 // ============================================
-// 1. التحقق من الـ Webhook (مطلوب من Meta)
+// 1. Webhook Verification (GET)
 // ============================================
 app.get('/webhook', (req, res) => {
     const mode = req.query['hub.mode'];
@@ -17,104 +19,54 @@ app.get('/webhook', (req, res) => {
     const challenge = req.query['hub.challenge'];
 
     if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-        console.log('✅ Webhook verified successfully');
+        console.log('✅ Webhook verified');
         return res.status(200).send(challenge);
     }
-
-    console.log('❌ Webhook verification failed');
     return res.sendStatus(403);
 });
 
 // ============================================
-// 2. استقبال وتوزيع أحداث WhatsApp
+// 2. استقبال وإعادة توجيه بدون أي تعديل (POST)
 // ============================================
 app.post('/webhook', async (req, res) => {
-    // ⚡ رد بـ 200 فوراً باش Meta ما تعيدش الإرسال
+    // ⚡ رد فوراً بـ 200 باش Meta ما تعيدش الإرسال
     res.sendStatus(200);
 
-    try {
-        const body = req.body;
+    // الـ body كما وصل بالضبط من WhatsApp
+    const rawBody = req.body;
 
-        if (body.object !== 'whatsapp_business_account') {
-            console.log('⏭️ تجاهل حدث غير تابع لـ WhatsApp');
-            return;
+    console.log('📥 Webhook received:', JSON.stringify(rawBody, null, 2));
+
+    // التوزيع على الجوج روابط بنفس البيانات الأصلية
+    const endpoints = [
+        process.env.ENDPOINT_ORDERS,
+        process.env.ENDPOINT_MESSAGES,
+    ];
+
+    const forwardPromises = endpoints.map(async (url) => {
+        if (!url) return;
+
+        try {
+            await axios.post(url, rawBody, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    // نقل Headers الأصلية من Meta (اختياري)
+                    'X-Hub-Signature-256': req.headers['x-hub-signature-256'] || '',
+                },
+                timeout: 5000,
+            });
+            console.log(`✅ Forwarded → ${url}`);
+        } catch (error) {
+            console.error(`❌ Failed → ${url}:`, error.message);
         }
+    });
 
-        // استخراج جميع التغييرات من الـ payload
-        const changes = body.entry?.flatMap(entry => entry.changes) || [];
-
-        for (const change of changes) {
-            const value = change.value;
-
-            // توزيع حسب نوع الحدث
-            if (value.messages || value.contacts) {
-                // 📨 رسائل واردة من العملاء
-                await forwardToEndpoint(
-                    process.env.ENDPOINT_MESSAGES,
-                    'messages',
-                    value
-                );
-            }
-
-            if (value.statuses) {
-                // 📊 تحديثات حالة الرسائل (sent, delivered, read, failed)
-                await forwardToEndpoint(
-                    process.env.ENDPOINT_ORDERS,
-                    'statuses',
-                    value
-                );
-            }
-
-            if (value.errors) {
-                // ❌ أخطاء API
-                console.error('⚠️ WhatsApp API Error:', value.errors);
-            }
-        }
-
-    } catch (error) {
-        console.error('❌ Error processing webhook:', error.message);
-    }
+    // تنفيذ التوازي بدون انتظار النتيجة
+    Promise.allSettled(forwardPromises);
 });
 
-// ============================================
-// 3. دالة التوزيع (Forwarding Function)
-// ============================================
-async function forwardToEndpoint(url, eventType, data) {
-    if (!url) {
-        console.warn(`⚠️ Endpoint غير محدد للحدث: ${eventType}`);
-        return;
-    }
-
-    try {
-        const response = await axios.post(url, {
-            event_type: eventType,
-            timestamp: new Date().toISOString(),
-            data: data,
-        }, {
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Webhook-Secret': process.env.WEBHOOK_VERIFY_TOKEN,
-            },
-            timeout: 5000,
-        });
-
-        console.log(`✅ تم توجيه [${eventType}] → ${url} (${response.status})`);
-
-    } catch (error) {
-        console.error(
-            `❌ فشل توجيه [${eventType}] → ${url}:`,
-            error.response?.status || error.message
-        );
-    }
-}
-
-// ============================================
-// 4. تشغيل السيرفر
-// ============================================
 app.listen(PORT, () => {
-    console.log(`🚀 Webhook Server running on port ${PORT}`);
-    console.log(`📡 GET  /webhook → Verification`);
-    console.log(`📥 POST /webhook → Receive & Distribute`);
-    console.log(`🔗 Orders Endpoint: ${process.env.ENDPOINT_ORDERS}`);
-    console.log(`💬 Messages Endpoint: ${process.env.ENDPOINT_MESSAGES}`);
+    console.log(`🚀 Proxy Webhook Server on port ${PORT}`);
+    console.log(`🔗 Orders:   ${process.env.ENDPOINT_ORDERS}`);
+    console.log(`💬 Messages: ${process.env.ENDPOINT_MESSAGES}`);
 });
